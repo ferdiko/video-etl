@@ -1,0 +1,21 @@
+# ignore data files and model weights
+*.zip
+*.xml
+*.ckpt
+*.ckp
+*.pt
+*.weight
+*.onnx
+*.png
+*.jpg
+*.mp4
+*.pkl
+
+# IntelliJ, MacOS, NFS
+.idea/
+.DS_Store
+DS_Store
+.nfs*
+
+# python
+__pycache__/

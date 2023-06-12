@@ -1,0 +1,1 @@
+{"mini": {"path": "./cache/model_mini.std", "hidden": 0.8, "fc": 5, "dropout": 0.1}, "small": {"path": "./cache/model_small.std", "hidden": 1.2, "fc": 1.5, "dropout": 0.0}, "regular": {"path": "./cache/model_regular.std", "hidden": 1.5, "fc": 2, "dropout": 0.2}}
