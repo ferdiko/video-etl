@@ -1,0 +1,9 @@
+{
+  "_comment": "Cost of renting the GCP instances for a time interval (2s). For lambda, we take the cost for 1 core and multiply it by 1.8 (in favor of the baselines).",
+  "4": 7.777777777777778e-05,
+  "8": 0.00015000000000000001,
+  "16": 0.00030000000000000003,
+  "32": 0.0005944444444444444,
+  "60": 0.0013944444444444442,
+  "lambda": 3.500000000000001e-05
+}

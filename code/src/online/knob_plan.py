@@ -2,6 +2,7 @@
 import tensorflow as tf
 from tensorflow.keras import Sequential
 from tensorflow.keras.layers import Dense
+from keras.models import load_model
 
 import numpy as np
 from sklearn.cluster import KMeans
@@ -37,10 +38,7 @@ class KnobPlanner:
                 knob_cost,
                 hours_plan_ahead,
                 time_interval,
-                knob_order,
-                corr,
-                config_belong,
-                runtimes,
+                forecast_weights,
                 input_hours=96,
                 linear_programming=True,
                 verbose=False):
@@ -53,51 +51,28 @@ class KnobPlanner:
         - time_interval (float): how many seconds is each data interval long.
             Needed for determining how many data points 1 input/output day
             consists of
-        - knob_order (dict): knob name (as in processed files) and position in
-            categories and knob_cost
-        - corr: correlation matrix
-        - config_belong: to which config does a runtime-cost pair belong (if
-            several placements / config, then not 0,1,2,3, ...)
-        - runtimes
         - input_hours (float): hours of history that forecast NN gets as input
         - linear_programming (Bool): Use linear programming or 0-1 knapsack to
           assign knob settings to categories
         """
 
         self.categories = categories
-        self.knob_cost = knob_cost
-        self.hours_plan_ahead = plan_ahead
+        self.knob_cost = np.array(knob_cost)
+        self.hours_plan_ahead = hours_plan_ahead
         self.num_cluster = categories.shape[0]
         self.num_knobs = categories.shape[1]
         self.knob_place = knob_cost.shape[0]
         self.time_interval = time_interval
-        self.knob_order = knob_order
         self.verbose = verbose
-        self.runtimes = runtimes
-        # print("rt constr", runtimes)
-        self.corr = corr
-        self.config_belong = config_belong
-        # print("belong", config_belong)
-        assert config_belong.shape == runtimes.shape == knob_cost.shape
-        assert corr.shape == (self.num_cluster,self.num_cluster)
-
-        # self.forecast = WorkloadForecast()
-        self.forecast = Sequential()
-        x_shape = (input_hours*2*int(3600/time_interval),)
-        self.forecast.add(Dense(100, input_shape=x_shape, activation='relu'))
-        self.forecast.add(Dense(30, activation='relu'))
-        self.forecast.add(Dense(self.num_cluster, activation='relu'))
-        self.forecast.compile(optimizer='adam', loss='mse', metrics=['mean_absolute_error'])
-
-        # hyperparams
+        self.forecaster = load_model(forecast_weights)
         self.linear_programming = linear_programming
         self.input_hours = input_hours
 
 
     def assign_knobs_lin_prog(self, mixture, budget):
-        # YOLO calls per second
-        A = np.zeros((3*self.num_cluster+1, self.knob_place*self.num_cluster), dtype=float)
-        b = np.zeros((3*self.num_cluster+1,), dtype=float)
+        # define linear program
+        A = np.zeros((2*self.num_cluster+1, self.knob_place*self.num_cluster), dtype=float)
+        b = np.zeros((2*self.num_cluster+1,), dtype=float)
         c = np.zeros((self.knob_place*self.num_cluster,), dtype=float)
 
         # enforce that distributions add up to 1
@@ -108,27 +83,18 @@ class KnobPlanner:
             b[2*i] = 1
             b[2*i+1] = -1
 
-        # enforce runtime / buffering contraint
-        # runtimes of different knob placements
-        for i in range(self.num_cluster):
-            for j in range(self.num_cluster):
-                for k in range(self.knob_place):
-                    A[2*self.num_cluster+i][j*self.knob_place+k] = self.runtimes[k] * self.corr[i][j] # mixture[j]
-            b[2*self.num_cluster+i] = 0.0
-        # print("rt", self.runtimes)
-
         # enforce below budget
         for i, m in enumerate(mixture):
             for j in range(self.knob_place):
-                A[3*self.num_cluster][i*self.knob_place+j] \
+                A[2*self.num_cluster][i*self.knob_place+j] \
                     = m*self.knob_cost[j] *self.hours_plan_ahead*3600
-        b[3*self.num_cluster] = budget #/(self.hours_plan_ahead*3600)
+        b[2*self.num_cluster] = budget #/(self.hours_plan_ahead*3600)
 
         # score TODO maybe just put the mutilplying factors only where we estimate
         # the score. could be better for num stab?
         for i, center in enumerate(self.categories):
             for j in range(self.knob_place):
-                c[i*self.knob_place+j] = -mixture[i] * center[self.config_belong[j]] \
+                c[i*self.knob_place+j] = -mixture[i] * center[j] \
                     * self.hours_plan_ahead*3600/self.time_interval
 
 
@@ -144,13 +110,15 @@ class KnobPlanner:
         #     # print()
         # print("c", c)
 
-
         # Solve linear program
         res = linprog(c, A_ub=A, b_ub=b, bounds=(0,1)) #, method='lstsq', options = {"presolve":True})
 
-        print("\nKnob planner (lin solve):", res.message)
-        print('Expected score:', round(-res.fun, ndigits=4))
-        if self.verbose:
+        if res.fun is None or self.verbose:
+            print("\nKnob planner (lin solve):", res.message)
+            raise Exception("[Knob planner error] Linear program is infeasible, please adjust the configuration (e.g. increase budget or num_cores).")
+        elif self.verbose:
+            print("\nKnob planner (lin solve):", res.message)
+            print('Expected score:', round(-res.fun, ndigits=4))
             sol = list(res.x)
             print("Solution linear program:")
             for i in range(self.num_cluster):
@@ -160,6 +128,7 @@ class KnobPlanner:
 
         res_copy = copy.copy(res.x)
 
+        res_copy = res_copy.reshape((self.num_cluster, self.knob_place))
         return res_copy, -res.fun
 
 
@@ -249,10 +218,8 @@ class KnobPlanner:
             histo = np.bincount(labels)
             y[i, :histo.shape[0]] = histo
 
-
         # for i in range(self.input_hours*points_per_hour*2):
         #     print("{},".format(X[0,i]), end="")
-
 
         # Cast to np array and normalize
         # TODO: When normalizing X you need to make sure that knob idx and score more or less same size
@@ -290,6 +257,7 @@ class KnobPlanner:
         #     knobs[knob_name] = i
 
         # build dict which maps time -> knob score vector
+        knob_order = { "10": 0, "20": 1, "30": 2, "50": 3, "75": 4, "200": 5 }
         score = defaultdict(lambda: [-1]*6)
         keys_list = []
         for file in os.listdir(foldername):
@@ -302,7 +270,7 @@ class KnobPlanner:
 
                 key = get_key(l.split(",")[0], int(l.split(",")[2]))
                 keys_list.append(key)
-                knob = self.knob_order[l.split(",")[1]]
+                knob = knob_order[l.split(",")[1]]
                 sc = int(l.split(",")[4])
                 score[key][knob] = sc
 
@@ -342,6 +310,13 @@ class KnobPlanner:
                             callbacks=[model_checkpoint_callback])
 
 
+    def forecast(self, input):
+        input = tf.convert_to_tensor([input])
+        forecast = self.forecaster(input)[0].numpy()
+        # forecast /= forcast.sum()
+        return forecast
+
+
     def plan(self, input, budget, use_gt_histo=False, histogram=None):
         # predict input
         if use_gt_histo:
@@ -349,8 +324,7 @@ class KnobPlanner:
                 histogram = pickle.load(f)
 
         else:
-            histogram = np.array(self.forecast(input))[0]
-            histogram /= histogram.sum()
+            histogram = self.forecast(input)
 
         if self.verbose:
             print(histogram)

@@ -1,0 +1,6 @@
+{
+  "cloud_budget": 0,
+  "num_cores": 8,
+  "buffer_size": 16000000000,
+  "planning_interval": 86400
+}

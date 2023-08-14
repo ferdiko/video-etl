@@ -1,188 +1,116 @@
 import numpy as np
+import json
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from knob_plan import KnobPlanner
-import pickle
 
 
-def knob_switch(debug):
+class SkyscraperSwitcher:
 
-    """
-    Knob switcher when given placements costs and file with
-    quality at each video segment
-    """
+    def __init__(self, args, buffer):
 
-    with open("categories.np", "rb") as f:
-        categories = pickle.load(f)
+        # read config
+        with open(args["config_file"], "r") as f:
+            cfg = json.load(f)
 
-    with open("pred.np", "rb") as f:
-        histogram = pickle.load(f)
+        # parse out values from experiment cfg
+        self.cloud_budget = cfg["cloud_budget"]
+        self.categories = np.load(args["categories"])
+        self.plan_ahead = 24 # TODO: currently fixed according to provided NN weights
+        self.time_interval = 2 # TODO: currently fixed according to sim file
+        self.planning_interval = cfg["planning_interval"]
+        self.budget = self.plan_ahead*3600*2 + self.cloud_budget
 
-    with open("knob_cost.np", "rb") as f:
-        knob_costs = pickle.load(f)
+        # read profiling results
+        with open(args["prof_file"], "r") as f:
+            prof = json.load(f)[str(cfg["num_cores"])]
 
-    with open("covid_bw.place", "rb") as f:
-        hw_dict = pickle.load(f)
+        self.cloud_cost = prof["cloud_cost"]
+        self.runtimes = prof["runtime"]
+        self.corr_config = prof["knob_config"]
 
-    corr = np.zeros((3,3)) # TODO
+        # configuratoins-placements sorted according to preference:
+        # for each content category sort descending to quality, ascending to cost
+        quality_sort = []
+        for i_qual in range(self.categories.shape[0]):
+            quality_sort.append(np.argsort(-self.categories[i_qual]))
 
-    # ablation
-    allowed = ["everything", "buffer_only", "cloud_only", "none"]
-    allowed = allowed[0]
+        config_prio = []
+        for qual_sort in quality_sort:
+            cluster_prio = []
+            for c in qual_sort:
+                config_cluster_prio = []
+                # get all placements
+                for p, (r, co, con) in enumerate(zip(self.runtimes, self.cloud_cost, self.corr_config)):
+                    if con == c:
+                        config_cluster_prio.append((co, p, r, con))
+                cluster_prio += sorted(config_cluster_prio)
+            config_prio.append(cluster_prio)
 
-    plan_dict = {
-                  0: (np.array([0]*len(knob_costs)), np.array(knob_costs), np.array([i for i in range(len(knob_costs))]))
-                }
+        self.config_prio = config_prio
 
-    with open("covid_bw.place", "rb") as f:
-        hw_dict = pickle.load(f)
+        # get knob cost for planner
+        self.knob_cost = np.zeros(self.categories.shape[1])
+        for r, c, b in zip(self.runtimes, self.cloud_cost, self.corr_config):
+            if c == 0:
+                self.knob_cost[b] = r
 
-    budgets = np.linspace(24*3600*1000, 3628800000.0/2, 10) #np.linspace(5590080, 3628800000.0/2, 10)
-    cloud_budgets = budgets
-    cores_list = [2, 4, 8, 16, 24, 32, 48]
+        # instantiate planner
+        self.planner = KnobPlanner(self.categories,
+                                   self.knob_cost,
+                                   hours_plan_ahead=self.plan_ahead,
+                                   time_interval=self.time_interval,
+                                   forecast_weights=args["weights_file"]
+                                   )
 
-    plan_ahead = 24 # plan 48 hours ahead
-    knob_order = { "10": 0, "20": 1, "30": 2, "50": 3, "75": 4, "200": 5 }
+        # initialize switcher state
+        self.cur_knob = 0
+        self.category_counter = np.load(f"{args['workload']}/train_histogram.npy") # first prediction based on training data
+        self.counter = 0
+        self.buffer = buffer
 
-    buffering_allowed = True
-    cloud_allowed = False
 
-    if not buffering_allowed and not cloud_allowed:
-        cloud_budgets = np.array([24*3600*1000])
+    def reset_counts(self):
+        self.category_counter = np.zeros(self.categories.shape[0])
+        self.used_configs_counter = np.ones(self.categories.shape)
 
-    final_scores = [[] for _ in range(len(cores_list))]
-    final_costs = [[] for _ in range(len(cores_list))]
 
-    realtime = 5000
-    num_secs = 5 # cost is over how many secs
+    def switch(self, cur_score):
 
-    # get quality sorted. if a knob config doesnt fit into buffer, we can use
-    # next worse one that fits
-    quality_sort = []
-    for i_qual in range(categories.shape[0]):
-        quality_sort.append(np.argsort(-categories[i_qual]))
+        if self.counter % self.planning_interval == 0:
+            self.histogram = self.category_counter/np.sum(self.category_counter)
+            self.plan, score = self.planner.plan(input=self.histogram, budget=self.budget,) # TODO: delete out histogram
+            self.reset_counts()
+            self.buffer.computed_plan()
 
-    # get runtimes for planning
-    runtimes, knob_cost, config_belong = plan_dict[0]
-    runtimes = np.array(runtimes) #- realtime
-    knob_cost = np.array(knob_cost) / num_secs
-    config_belong = np.array(config_belong)
+        # get current content category
+        dynamics = np.argmin(np.abs(self.categories[:, self.cur_knob] - cur_score))
 
-    for budget in cloud_budgets:
+        # get preferred knob configuration
+        used_configs = self.used_configs_counter[dynamics]/np.sum(self.used_configs_counter[dynamics])
+        ratio_error = self.plan[dynamics] - used_configs
+        knob_place = np.argmax(ratio_error)
 
-        for i, num_cores in enumerate(cores_list):
+        # search start idx of planned knob config in priority list
+        idx = 0
+        while self.config_prio[dynamics][idx][3] != knob_place:
+            idx += 1
 
-            knob_cost = np.zeros(categories.shape[1])
-            # cur = 0
-            for r, c, b in zip(hw_dict[num_cores][0], hw_dict[num_cores][1], hw_dict[num_cores][2]):
-                if c == 0:
-                    knob_cost[b] = r
+        # choose placement (or other config) such that buffer doesn't overflow
+        while not self.buffer.fits(self.config_prio[dynamics][idx][2]):
+            idx += 1
 
-            runtimes = np.zeros(len(knob_cost))
-            config_belong = np.array([i for i in range(len(knob_cost))])
-            knob_cost = np.array(knob_cost)
+        # final knob configuration and placement
+        self.cur_knob = self.config_prio[dynamics][idx][3]
+        placement = self.config_prio[dynamics][idx][1]
+        cloud_cost = self.config_prio[dynamics][idx][0]
+        runtime = self.config_prio[dynamics][idx][2]
 
-            # plan
-            kp = KnobPlanner(categories, knob_cost, plan_ahead, time_interval=2, knob_order=knob_order, verbose = True, corr=corr, runtimes=runtimes, config_belong= config_belong)
-            plan, score = kp.plan(input=None, budget=budget, use_gt_histo=True, histogram=histogram)
+        # update
+        self.category_counter[dynamics] += 1
+        self.used_configs_counter[dynamics][self.cur_knob] += 1
+        self.buffer.update(self.cur_knob, runtime)
+        self.counter += 1
 
-            # get runtimes for hardware
-            runtimes, knob_cost, config_belong = hw_dict[num_cores]
-            runtimes = (np.array(runtimes) - realtime)
-            knob_cost = np.array(knob_cost) / num_secs
-            config_belong = np.array(config_belong)
-
-            # get config priorities
-            config_prio = []
-            # runtime, cost, config = hw_dict[num_cores]
-            for qual_sort in quality_sort:
-                cluster_prio = []
-                for c in qual_sort:
-                    config_cluster_prio = []
-                    # get all placements
-                    for r, co, con in zip(runtimes, knob_cost, config_belong):
-                        if con == c:
-
-                            if not buffering_allowed and r > 0:
-                                continue
-                            if not cloud_allowed and co > 0:
-                                continue
-                            config_cluster_prio.append((r, co, con))
-                    cluster_prio += sorted(config_cluster_prio, reverse=True)
-                config_prio.append(cluster_prio)
-
-            # knob switcher --> test on preproc input
-            buffer_size = 180*1000
-            buffer = 0
-
-            input = "covid_proc_60.csv"
-            runtimes, knob_cost, config_belong = plan_dict[0]
-            target_place = plan.reshape((categories.shape[0], knob_cost.shape[0]))
-
-            place_counts = np.ones(target_place.shape)
-
-            file = open(input, 'r')
-            file.readline()
-
-            score_sum = 0
-            cost_sum = 0
-            # policy = 0
-            use_knob = 2
-
-            if not buffering_allowed and not cloud_allowed:
-                none_dict = { 2: 2, 4: 2, 8: 3, 16: 0, 24: 0, 32: 0, 48: 1 }
-                use_knob = none_dict[num_cores]
-
-            consec_zeros = 0
-            last_skip = 100
-
-            while True:
-
-                # print(buffer)
-                line = file.readline()
-                if not line:
-                    break
-
-                cur_score = int(line.split(",")[1+use_knob])
-
-                score_sum += cur_score
-
-                # nearest cluster (dynamics)
-                dynamics = np.argmin(np.abs(categories[:, use_knob] - cur_score))
-
-                if int(line.split(",")[1]) == 0:
-                    consec_zeros += 1
-                else:
-                    consec_zeros = 0
-
-                if not buffering_allowed and not cloud_allowed:
-                    continue
-
-                # all placements that overflow the buffer impossible
-                buffer_space = buffer_size - buffer
-                ratio_error = target_place[dynamics] - (place_counts[dynamics]/np.sum(place_counts[dynamics]))
-
-                knob_place = np.argmax(ratio_error)
-
-                # search start idx of config prio
-                idx = 0
-                while config_prio[dynamics][idx][2] != knob_place:
-                    idx += 1
-
-                # search for next best placement
-                while config_prio[dynamics][idx][0] > buffer_space:
-                    idx += 1
-
-                # add cost etc.
-                buffer = max(0, buffer + config_prio[dynamics][idx][0])
-                cost_sum += config_prio[dynamics][idx][1]
-                use_knob = config_prio[dynamics][idx][2]
-                place_counts[dynamics][use_knob] += 1
-
-            final_scores[i].append(score_sum)
-            final_costs[i].append(cost_sum)
-
-    # print
-    print("cost,qual,cores")
-    for j, budget in enumerate(cloud_budgets):
-        for i, num_cores in enumerate(cores_list):
-            # cost = num_cores*3600*1000*24+1.5*budget
-            print("{},{},{}".format(final_costs[i][j], final_scores[i][j], num_cores))
+        return self.cur_knob, placement, cloud_cost, self.config_prio[dynamics][idx][2]
