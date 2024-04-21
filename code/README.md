@@ -40,3 +40,5 @@ We can only provide a subset of the data used in the experiments due to Google D
 The code for the three applications is in the respective workloads directories.
 
 Currently, the code in the applications is written for an earlier API, where the user overrides a Workload class that has the tunable knobs as class member variables. This has no effects on the results.
+
+**Update:** Please find the full month of traffic camera video [here](https://1drv.ms/u/s!Aj3pxfka-SsKgspRnyKEsZR98pgimQ?e=Ee81HH). The uncompressed data is 250GB, the time stamps are the starting times of the recordings in EST. Please contact me for access to further large-scale video data sets.
